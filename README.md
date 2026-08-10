@@ -83,6 +83,8 @@ The service handles Steam sessions automatically. Every layout carries an owner 
 | `fallback_mode` | `1920x1080@120` | used when no recent client hint is available |
 | `auto` | `true` | switch automatically on session start/end |
 | `inhibit_idle` | `true` | hold an idle/sleep inhibitor during a session |
+| `scratch_desktop` | `true` | stream on a throwaway virtual desktop so the desktop's own windows, which KWin migrates onto the dummy, stay out of the session |
+| `scratch_desktop_name` | `Streaming` | name given to that virtual desktop |
 | `steam_log` | `~/.steam/steam/logs/streaming_log.txt` | where to read the client capture hint |
 | `capture_hint_max_age` | `120` | seconds before a capture hint is considered stale |
 | `settle_timeout` | `10.0` | seconds to wait for KWin to apply a layout |

@@ -43,6 +43,8 @@ DEFAULTS = {
     "auto": "true",
     "hdr": "false",
     "inhibit_idle": "true",
+    "scratch_desktop": "true",
+    "scratch_desktop_name": "Streaming",
     "settle_timeout": "10.0",
 }
 
@@ -399,6 +401,70 @@ def stop_inhibitor(pid: int | None) -> None:
         log(f"could not stop idle inhibitor {pid}: {exc}")
 
 
+KWIN_VD = ("org.kde.KWin", "/VirtualDesktopManager", "org.kde.KWin.VirtualDesktopManager")
+_UUID = r"[0-9a-fA-F-]{36}"
+
+
+def _busctl(*args: str) -> str:
+    return subprocess.run(["busctl", "--user", *args], check=True, capture_output=True,
+                          text=True).stdout.strip()
+
+
+def _vd_current() -> str:
+    out = _busctl("get-property", *KWIN_VD, "current")
+    return out.split('"')[1]
+
+
+def _vd_set_current(desktop_id: str) -> None:
+    _busctl("set-property", *KWIN_VD, "current", "s", desktop_id)
+
+
+def _enabled(cfg, key: str) -> bool:
+    return str(cfg.get(key, "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def enter_scratch_desktop(cfg) -> tuple[str, str] | None:
+    """Park the session on a throwaway virtual desktop.
+
+    Disabling every real output makes KWin migrate those outputs' windows onto the
+    dummy, so the client opens onto a screen full of the desktop's own windows.
+    Virtual-desktop assignment survives that migration, so switching to a fresh empty
+    desktop gives the session a clean screen without touching any window.
+    """
+    if not _enabled(cfg, "scratch_desktop"):
+        return None
+    name = str(cfg.get("scratch_desktop_name", "Streaming")).strip() or "Streaming"
+    try:
+        previous = _vd_current()
+        count = int(_busctl("get-property", *KWIN_VD, "count").split()[-1])
+        _busctl("call", *KWIN_VD, "createDesktop", "us", str(count), name)
+        listing = _busctl("get-property", *KWIN_VD, "desktops")
+        found = re.findall(rf'"({_UUID})" "{re.escape(name)}"', listing)
+        if not found:
+            log(f"could not find the {name!r} virtual desktop after creating it")
+            return None
+        scratch = found[-1]
+        _vd_set_current(scratch)
+    except (subprocess.CalledProcessError, FileNotFoundError, ValueError, IndexError) as exc:
+        log(f"could not create a scratch virtual desktop: {exc}")
+        return None
+    log(f"streaming on scratch virtual desktop {name!r}")
+    return previous, scratch
+
+
+def leave_scratch_desktop(state: dict) -> None:
+    scratch = state.get("scratch_desktop")
+    if not scratch:
+        return
+    previous = state.get("previous_desktop")
+    try:
+        if previous and _vd_current() == scratch:
+            _vd_set_current(previous)
+        _busctl("call", *KWIN_VD, "removeDesktop", "s", scratch)
+    except (subprocess.CalledProcessError, FileNotFoundError, IndexError) as exc:
+        log(f"could not remove the scratch virtual desktop: {exc}")
+
+
 def activate(cfg, owner: str, hint=None) -> bool:
     with StateLock():
         state = read_state()
@@ -480,6 +546,9 @@ def activate(cfg, owner: str, hint=None) -> bool:
 
         state = read_state()
         state["inhibitor_pid"] = start_inhibitor(cfg)
+        desktops = enter_scratch_desktop(cfg)
+        if desktops:
+            state["previous_desktop"], state["scratch_desktop"] = desktops
         write_state(state)
         log(f"remote mode active on {dummy_name} @ {mode}")
         return True
@@ -539,6 +608,7 @@ def deactivate(cfg, force: bool = False, owner: str | None = None) -> bool:
             log(f"layout is owned by {state.get('owner')!r}, not {owner!r}; leaving it alone")
             return True
         stop_inhibitor(state.get("inhibitor_pid"))
+        leave_scratch_desktop(state)
         ok = _restore(state.get("snapshot") or [], state.get("dummy", ""),
                       float(cfg["settle_timeout"]))
         clear_state()
