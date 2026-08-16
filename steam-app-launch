@@ -7,15 +7,24 @@ EXIT_GRACE="${3:-20}"
 POLL=2
 
 if [ -z "$APPID" ]; then
-    echo "usage: steam-app-launch <appid> [start-timeout] [exit-grace]" >&2
+    echo "usage: steam-app-launch <appid|rungameid> [start-timeout] [exit-grace]" >&2
     exit 2
+fi
+
+## Non-Steam shortcuts must be launched by their 64-bit rungameid, but they still announce
+## themselves under the 32-bit shortcut appid held in its high half. The shift is done in
+## python because a rungameid overflows bash's signed 64-bit arithmetic.
+if [ "${#APPID}" -gt 10 ]; then
+    LAUNCH_ID=$(python3 -c "print(int('${APPID}') >> 32)")
+else
+    LAUNCH_ID="$APPID"
 fi
 
 ## True while the game's reaper is alive. Steam runs an install-script evaluator under the
 ## same "SteamLaunch AppId=<id>" banner before the game itself, distinguished only by the
 ## Install=1 argument, so that one must not count as the game.
 running() {
-    pgrep -a -f "SteamLaunch AppId=${APPID}" 2>/dev/null | grep -qv "Install=1"
+    pgrep -a -f "SteamLaunch AppId=${LAUNCH_ID}" 2>/dev/null | grep -qv "Install=1"
 }
 
 ## Block until the game is up, or fail after START_TIMEOUT so a broken launch cannot hang forever.
