@@ -19,6 +19,10 @@ chmod 644 /lib/firmware/edid/remoteplay-dummy.edid
 install -Dm644 "$REPO/remoteplay-dummy-edid@.service" \
     /etc/systemd/system/"remoteplay-dummy-edid@.service"
 
+if grep -q 'firmware/edid/remoteplay-dummy.edid' /etc/mkinitcpio.conf 2>/dev/null; then
+    mkinitcpio -P
+fi
+
 systemctl daemon-reload
 systemctl enable "remoteplay-dummy-edid@${CONNECTOR}.service"
 
