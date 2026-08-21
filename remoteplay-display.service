@@ -1,5 +1,5 @@
 [Unit]
-Description=Route Steam Remote Play sessions to the dummy HDMI output
+Description=Route Steam Remote Play sessions to the dummy output
 PartOf=graphical-session.target
 After=graphical-session.target
 
