@@ -119,6 +119,25 @@ To try one without rebooting, `sudo ./dummy-edid install` writes it live and for
 
 Verify the kernel took it with `modetest -M nvidia-drm -c` (or your driver's name) rather than `kscreen-doctor`, which reports the compositor's cached list.
 
+### DisplayPort dummies are bandwidth-limited
+
+An HDMI dummy is effectively a bare EEPROM: nothing receives the signal, so an overridden EDID can advertise whatever the TMDS clock allows and the driver will scan it out. A **DisplayPort** dummy is not that. The driver still link-trains against the plug's DPCD and then validates every mode against the rate it trained at, so a cheap plug silently discards the entire timing set and leaves you on the 640x480 fallback no matter what the EDID says.
+
+Measure the ceiling instead of guessing — build an EDID containing a ladder of one resolution at rising refresh rates, install it, and see which survive:
+
+```sh
+sudo ./dummy-edid install --connector DP-3 --source ladder.edid
+modetest -M nvidia-drm -c
+```
+
+Then pass the result to the builder. `build-dummy-modes.py --max-clock MHZ` switches to a derated timing set when the ceiling is at or below `LOWBW_MHZ`, and `install-edid.sh` takes it as a second argument:
+
+```sh
+sudo ./install-edid.sh DP-3 160
+```
+
+The derated set keeps the exact-cadence property Sunshine needs; it just cannot reach the high-refresh modes. Drop the argument once the plug can carry them.
+
 ## Sunshine / Moonlight
 
 Sunshine sessions never create Steam's null sink, so the daemon cannot see them. Sunshine announces them instead — add this to `~/.config/sunshine/sunshine.conf`:

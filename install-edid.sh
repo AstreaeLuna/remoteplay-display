@@ -3,16 +3,18 @@
 set -euo pipefail
 
 CONNECTOR="${1:-HDMI-A-2}"
+MAX_CLOCK="${2:-600}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo "run as root: sudo $0 [connector]" >&2
+    echo "run as root: sudo $0 [connector] [max-clock-mhz]" >&2
     exit 1
 fi
 
 install -Dm755 "$REPO/dummy-edid" /usr/local/bin/dummy-edid
 install -d /lib/firmware/edid
-python3 "$REPO/build-dummy-modes.py" --out /lib/firmware/edid/remoteplay-dummy.edid
+python3 "$REPO/build-dummy-modes.py" --max-clock "$MAX_CLOCK" \
+    --out /lib/firmware/edid/remoteplay-dummy.edid
 chmod 644 /lib/firmware/edid/remoteplay-dummy.edid
 install -Dm644 "$REPO/remoteplay-dummy-edid@.service" \
     /etc/systemd/system/"remoteplay-dummy-edid@.service"

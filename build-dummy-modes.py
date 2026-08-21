@@ -15,6 +15,7 @@ GENERATOR = Path(__file__).resolve().parent / "dummy-edid"
 DST = Path("/lib/firmware/edid/remoteplay-dummy.edid")
 
 TMDS_MHZ = 600
+LOWBW_MHZ = 160
 PANEL_MAX_NITS = 800
 PANEL_MIN_NITS = 0.6154
 RANGE_DESC = 90
@@ -124,15 +125,38 @@ def hdr_blocks(max_nits, min_nits):
 W10, H10 = 520, 325
 W9, H9 = 520, 292
 
-MODES = [
-    (cvt_rb(2400, 1500, 144), W10, H10),
-    (cvt_rb(2560, 1600, 120), W10, H10),
-    (cvt_rb(3840, 2160, 60), W9, H9),
-    (cvt_rb(2560, 1440, 120), W9, H9),
-    (cvt_rb(1920, 1200, 144), W10, H10),
-    (cvt_rb(1920, 1200, 89), W10, H10),
-    (cvt_rb(1920, 1080, 120), W9, H9),
-]
+def full_modes():
+    """One exact-cadence mode per client, sized for a link that can carry 600 MHz."""
+    return [
+        (cvt_rb(2400, 1500, 144), W10, H10),
+        (cvt_rb(2560, 1600, 120), W10, H10),
+        (cvt_rb(3840, 2160, 60), W9, H9),
+        (cvt_rb(2560, 1440, 120), W9, H9),
+        (cvt_rb(1920, 1200, 144), W10, H10),
+        (cvt_rb(1920, 1200, 89), W10, H10),
+        (cvt_rb(1920, 1080, 120), W9, H9),
+    ]
+
+
+def lowbw_modes():
+    """The same client targets derated for a dummy plug whose DP link tops out near 160 MHz.
+
+    A passive DisplayPort dummy is not the bandwidth-transparent EEPROM an HDMI one is: the
+    driver still link-trains against the plug's DPCD and rejects every mode the trained link
+    cannot carry, no matter what the overridden EDID advertises. A plug measured at roughly
+    4 Gbit/s leaves ~160 MHz of pixel clock, so the full table collapses to the 640x480
+    fallback. These timings keep the exact-cadence property Sunshine needs while fitting under
+    that wall; swap back to the full table once the plug can carry it.
+    """
+    return [
+        (cvt_rb(1920, 1200, 60), W10, H10),
+        (cvt_rb(1920, 1080, 60), W9, H9),
+        (cvt_rb(2560, 1600, 30), W10, H10),
+        (cvt_rb(2560, 1440, 30), W9, H9),
+        (cvt_rb(1680, 1050, 75), W10, H10),
+        (cvt_rb(1280, 800, 120), W10, H10),
+        (cvt_rb(1280, 720, 120), W9, H9),
+    ]
 
 
 def pristine_base() -> bytes:
@@ -151,29 +175,34 @@ def pristine_base() -> bytes:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DST)
+    parser.add_argument("--max-clock", type=int, default=TMDS_MHZ,
+                        help="pixel-clock ceiling in MHz the link can actually carry")
     args = parser.parse_args()
+
+    ceiling = args.max_clock
+    modes = full_modes() if ceiling > LOWBW_MHZ else lowbw_modes()
 
     src = bytearray(pristine_base())
     assert len(src) == 256, "expected a 128-byte base block plus one CTA extension"
     base, ext = bytearray(src[:128]), bytearray(src[128:])
 
-    for t, _, _ in MODES:
+    for t, _, _ in modes:
         print(f"{t['hact']}x{t['vact']}@{t['refresh']:<4} {t['pclk']/1e6:7.2f} MHz "
               f"{t['pclk']/t['htotal']/1e3:6.1f} kHz  "
               f"{t['htotal']}x{t['vtotal']} blank {t['hblank']}/{t['vblank']}")
-        assert t["pclk"] / 1e6 <= TMDS_MHZ, "exceeds the 600 MHz TMDS ceiling"
+        assert t["pclk"] / 1e6 <= ceiling, f"exceeds the {ceiling} MHz ceiling"
         assert int(t["pclk"]) % 10_000 == 0, "pixel clock is not exactly encodable"
 
-    base[54:72] = dtd(*MODES[0])
-    base[72:90] = dtd(*MODES[1])
+    base[54:72] = dtd(*modes[0])
+    base[72:90] = dtd(*modes[1])
 
     assert base[RANGE_DESC:RANGE_DESC + 4] == b"\x00\x00\x00\xfd", "range-limit descriptor moved"
     base[RANGE_MAX_V] = 150
     base[RANGE_MAX_H] = 250
-    base[RANGE_MAX_CLOCK] = TMDS_MHZ // 10
+    base[RANGE_MAX_CLOCK] = ceiling // 10
 
     assert ext[1] == 0x03 and ext[2] == 0x17, "unexpected CTA extension layout"
-    ext[HF_VSDB_MAX_TMDS] = TMDS_MHZ // 5
+    ext[HF_VSDB_MAX_TMDS] = ceiling // 5
 
     extra = hdr_blocks(PANEL_MAX_NITS, PANEL_MIN_NITS)
     dtd_start = ext[2]
@@ -182,7 +211,7 @@ def main():
     ext[2] = dtd_start + len(extra)
 
     p = ext[2]
-    for t, hmm, vmm in MODES[2:]:
+    for t, hmm, vmm in modes[2:]:
         ext[p:p + 18] = dtd(t, hmm, vmm)
         p += 18
     assert p <= 127, "too many detailed timings for one extension block"
