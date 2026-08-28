@@ -130,13 +130,15 @@ sudo ./dummy-edid install --connector DP-3 --source ladder.edid
 modetest -M nvidia-drm -c
 ```
 
-Then pass the result to the builder. `build-dummy-modes.py --max-clock MHZ` switches to a derated timing set when the ceiling is at or below `LOWBW_MHZ`, and `install-edid.sh` takes it as a second argument:
+Then pass the result to the builder. `build-dummy-modes.py --max-clock MHZ` picks one of three timing sets by where the ceiling falls — full above `MIDBW_MHZ`, derated above `LOWBW_MHZ`, heavily derated below it — and `install-edid.sh` takes it as a second argument:
 
 ```sh
-sudo ./install-edid.sh DP-3 160
+sudo ./install-edid.sh DP-3 340
 ```
 
-The derated set keeps the exact-cadence property Sunshine needs; it just cannot reach the high-refresh modes. Drop the argument once the plug can carry them.
+Every derated set keeps the exact-cadence property Sunshine needs, and only lists refresh rates a Moonlight client actually asks for; the sets differ in how high they can reach. Drop the argument once the plug can carry the full table.
+
+Two plugs measured so far, both on DP-3 of an RTX PRO 6000: the first topped out near **160 MHz**, which collapsed the full table to the 640x480 fallback; its replacement carries **340 MHz** — 1920x1200@120 and 1920x1080@120 pass, 1920x1080@150 and above do not. Neither comes close to the 600 MHz an HDMI dummy allows, so re-measure every plug rather than trusting its marketing.
 
 ## Sunshine / Moonlight
 

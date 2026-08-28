@@ -15,6 +15,7 @@ GENERATOR = Path(__file__).resolve().parent / "dummy-edid"
 DST = Path("/lib/firmware/edid/remoteplay-dummy.edid")
 
 TMDS_MHZ = 600
+MIDBW_MHZ = 340
 LOWBW_MHZ = 160
 PANEL_MAX_NITS = 800
 PANEL_MIN_NITS = 0.6154
@@ -138,6 +139,24 @@ def full_modes():
     ]
 
 
+def midbw_modes():
+    """The same client targets for a plug measured at roughly 340 MHz of pixel clock.
+
+    Every refresh here is one a Moonlight client actually asks for, so the exact-cadence
+    property Sunshine needs survives the derate; 1920x1080@140 would fit the link but no
+    client would ever request it.
+    """
+    return [
+        (cvt_rb(2560, 1600, 75), W10, H10),
+        (cvt_rb(1920, 1200, 120), W10, H10),
+        (cvt_rb(2560, 1440, 75), W9, H9),
+        (cvt_rb(2400, 1500, 75), W10, H10),
+        (cvt_rb(1920, 1080, 120), W9, H9),
+        (cvt_rb(3840, 2160, 30), W9, H9),
+        (cvt_rb(1920, 1200, 89), W10, H10),
+    ]
+
+
 def lowbw_modes():
     """The same client targets derated for a dummy plug whose DP link tops out near 160 MHz.
 
@@ -180,7 +199,12 @@ def main():
     args = parser.parse_args()
 
     ceiling = args.max_clock
-    modes = full_modes() if ceiling > LOWBW_MHZ else lowbw_modes()
+    if ceiling > MIDBW_MHZ:
+        modes = full_modes()
+    elif ceiling > LOWBW_MHZ:
+        modes = midbw_modes()
+    else:
+        modes = lowbw_modes()
 
     src = bytearray(pristine_base())
     assert len(src) == 256, "expected a 128-byte base block plus one CTA extension"
