@@ -8,6 +8,10 @@
 # substitution. Use in place of `gamescope`, dropping -W/-H/-r/-f/--hdr-enabled:
 #
 #   MANGOHUD_CONFIG=full rpd-gamescope --mangoapp -- obs-gamecapture %command%
+#
+# Set RPD_NO_HDR=1 for a title whose client-side HDR path misbehaves (Proton frame generation
+# ghosting under DXVK_HDR is one): the game runs SDR while the display keeps its HDR state.
+# The resolved --hdr-enabled flag is dropped and DXVK_HDR stays unset.
 set -euo pipefail
 
 # Steam inherits the systemd user session PATH, which does not carry ~/.local/bin, so
@@ -21,10 +25,15 @@ else
     flags="-f"
 fi
 
-case " $flags " in
-    *" --hdr-enabled "*) export DXVK_HDR=1 ;;
-    *) unset DXVK_HDR ;;
-esac
+if [ -n "${RPD_NO_HDR:-}" ]; then
+    flags=${flags// --hdr-enabled/}
+    unset DXVK_HDR
+else
+    case " $flags " in
+        *" --hdr-enabled "*) export DXVK_HDR=1 ;;
+        *) unset DXVK_HDR ;;
+    esac
+fi
 
 # keyd's virtual pointer and Sunshine's absolute mouse both carry ABS axes, so udev
 # tags them ID_INPUT_JOYSTICK and SDL enumerates them as gamepads. A game that binds
