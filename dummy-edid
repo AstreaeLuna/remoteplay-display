@@ -237,7 +237,7 @@ def cmd_install(args) -> int:
 
 
 def cmd_clear(args) -> int:
-    connector_debugfs(args.connector).write_bytes(b"")
+    connector_debugfs(args.connector).write_bytes(b"reset")
     reprobe(args.connector)
     print(f"cleared EDID override on {args.connector}")
     return 0
