@@ -46,6 +46,7 @@ DEFAULTS = {
     "scratch_desktop": "true",
     "scratch_desktop_name": "Streaming",
     "settle_timeout": "10.0",
+    "ignore": "",
     "staged": "",
     "stage_gap": "0.5",
     "chain_settle": "3.0",
@@ -80,6 +81,11 @@ def load_config() -> configparser.SectionProxy:
 
 def _csv(cfg, key: str) -> set[str]:
     return {n.strip() for n in str(cfg.get(key, "")).split(",") if n.strip()}
+
+
+def ignored_outputs(cfg) -> set[str]:
+    """Connector names this instance never touches (another instance's dummy, etc.)."""
+    return _csv(cfg, "ignore")
 
 
 STAGED_CACHE = STATE_DIR / "staged-identities.json"
@@ -755,7 +761,8 @@ def activate(cfg, owner: str, hint=None) -> bool:
 
         outputs = read_outputs()
         dummy_name = cfg["dummy"].strip()
-        staged = resolve_staged(cfg, outputs) - {dummy_name}
+        skip = ignored_outputs(cfg) | {dummy_name}
+        staged = resolve_staged(cfg, outputs) - skip
         dummy = outputs.get(dummy_name)
         if dummy is None or not dummy.connected:
             log(f"dummy output {dummy_name!r} is not connected; refusing to switch")
@@ -779,7 +786,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
                 "hdr": o.hdr_enabled if o.hdr_capable else None,
             }
             for o in outputs.values()
-            if o.connected and o.name != dummy_name
+            if o.connected and o.name not in skip
         ]
         _repair_snapshot(snapshot)
 
@@ -791,7 +798,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
         targets += [
             Target(name=o.name, enabled=False)
             for o in outputs.values()
-            if o.name != dummy_name and o.name not in staged and o.enabled
+            if o.name not in skip and o.name not in staged and o.enabled
         ]
 
         log(f"switching to {dummy_name} @ {mode} ({reason}); "
@@ -823,7 +830,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
             return False
 
         settled = wait_until(
-            lambda snap: _only_enabled(snap, dummy_name)
+            lambda snap: _only_enabled(snap, dummy_name, skip)
             and _mode_matches(snap.get(dummy_name), mode),
             settle,
         )
@@ -834,7 +841,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
             except KScreenError as exc:
                 log(f"retry failed: {exc}")
             settled = wait_until(
-                lambda snap: _only_enabled(snap, dummy_name),
+                lambda snap: _only_enabled(snap, dummy_name, skip),
                 settle,
             )
             if settled is None:
@@ -889,8 +896,14 @@ def _mode_record(output: Output) -> dict | None:
     return {"width": mode.width, "height": mode.height, "refresh": mode.refresh}
 
 
-def _only_enabled(snapshot: dict[str, Output], name: str) -> bool:
-    enabled = {o.name for o in snapshot.values() if o.enabled}
+def _only_enabled(snapshot: dict[str, Output], name: str, skip: set[str] = frozenset()) -> bool:
+    """True when `name` is the only enabled output, ignoring outputs in `skip`.
+
+    `skip` may contain `name` itself (callers pass ignore | {dummy}); it must never be
+    filtered out here, or the check can never pass.
+    """
+    enabled = {o.name for o in snapshot.values()
+               if o.enabled and (o.name == name or o.name not in skip)}
     return enabled == {name}
 
 
@@ -1000,7 +1013,7 @@ def _restore(snapshot: list[dict], dummy_name: str, cfg) -> bool:
         log(f"cannot read outputs while restoring: {exc}")
         return False
 
-    skip = {dummy_name}
+    skip = ignored_outputs(cfg) | {dummy_name}
     entries = [e for e in snapshot if e["name"] not in skip]
     first = [e for e in entries if not e.get("staged")]
     later = [e for e in entries if e.get("staged")]
@@ -1109,6 +1122,7 @@ def cmd_rescue(cfg, _args) -> int:
     silently fails. This resolves them fresh.
     """
     dummy_name = cfg["dummy"].strip()
+    skip = ignored_outputs(cfg) | {dummy_name}
     cap = float(cfg.get("rescue_max_refresh", "0") or 0)
     try:
         outputs = read_outputs()
@@ -1118,7 +1132,7 @@ def cmd_rescue(cfg, _args) -> int:
 
     targets, x = [], 0
     for output in outputs.values():
-        if not output.connected or output.name == dummy_name:
+        if not output.connected or output.name in skip:
             continue
         candidates = [m for m in output.modes if cap <= 0 or m.refresh <= cap + 0.5]
         mode = max(candidates or output.modes,
@@ -1198,6 +1212,8 @@ def cmd_doctor(cfg, args) -> int:
     if staged_outputs(cfg):
         print(f"staged:    {sorted(resolve_staged(cfg, outputs)) or 'NONE MATCHED'} "
               f"(config: {', '.join(sorted(staged_outputs(cfg)))})")
+    if ignored_outputs(cfg):
+        print(f"ignore:    {', '.join(sorted(ignored_outputs(cfg)))}")
     dummy = outputs.get(dummy_name)
     if dummy is None or not dummy.connected:
         print(f"dummy:     NOT CONNECTED ({dummy_name}) - fix 'dummy' in {CONFIG_PATH}")
