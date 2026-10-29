@@ -73,6 +73,28 @@ def load_config() -> configparser.SectionProxy:
     return parser["remoteplay"]
 
 
+def edid_identity(connector: str) -> str | None:
+    """A stable identity for whatever is plugged into a connector, from its EDID.
+
+    Product name + serial descriptors + the numeric serial, so two monitors of the
+    same model stay apart even after the kernel renames their connectors.
+    """
+    for card in sorted(Path("/sys/class/drm").glob(f"card*-{connector}")):
+        try:
+            data = (card / "edid").read_bytes()
+        except OSError:
+            continue
+        if len(data) < 128:
+            continue
+        parts = [data[8:16].hex()]
+        for offset in range(54, 126, 18):
+            block = data[offset:offset + 18]
+            if block[0:3] == b"\x00\x00\x00" and block[3] in (0xFC, 0xFF):
+                parts.append(block[5:18].split(b"\n")[0].decode("ascii", "replace").strip())
+        return "|".join(parts)
+    return None
+
+
 @dataclass(frozen=True)
 class Mode:
     id: str
@@ -486,6 +508,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
         snapshot = [
             {
                 "name": o.name,
+                "identity": edid_identity(o.name),
                 "enabled": o.enabled,
                 "priority": o.priority,
                 "pos": list(o.pos),
@@ -616,23 +639,32 @@ def deactivate(cfg, force: bool = False, owner: str | None = None) -> bool:
         return ok
 
 
-def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bool:
-    try:
-        outputs = read_outputs()
-    except KScreenError as exc:
-        log(f"cannot read outputs while restoring: {exc}")
-        return False
+def _resolve(entry: dict, outputs: dict[str, Output], claimed: set[str]) -> Output | None:
+    """Find the connected output a snapshot entry refers to: by EDID identity, then name."""
+    ident = entry.get("identity")
+    if ident:
+        for o in outputs.values():
+            if o.connected and o.name not in claimed and edid_identity(o.name) == ident:
+                return o
+    o = outputs.get(entry["name"])
+    if o is not None and o.connected and o.name not in claimed:
+        return o
+    return None
 
+
+def _restore_targets(entries: list[dict], outputs: dict[str, Output],
+                     claimed: set[str]) -> list[Target]:
     targets: list[Target] = []
-    for entry in snapshot:
-        if entry["name"] == dummy_name:
-            continue
-        output = outputs.get(entry["name"])
-        if output is None or not output.connected:
+    for entry in entries:
+        output = _resolve(entry, outputs, claimed)
+        if output is None:
             log(f"skipping {entry['name']}: no longer connected")
             continue
+        claimed.add(output.name)
+        if output.name != entry["name"]:
+            log(f"{entry['name']} is now {output.name} (matched by EDID)")
         if not entry["enabled"]:
-            targets.append(Target(name=entry["name"], enabled=False))
+            targets.append(Target(name=output.name, enabled=False))
             continue
         mode_id = None
         record = entry.get("mode")
@@ -640,10 +672,10 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
             mode = output.match_mode(record["width"], record["height"], record["refresh"])
             mode_id = mode.id if mode else None
             if mode_id is None:
-                log(f"{entry['name']}: saved mode {record['width']}x{record['height']} "
+                log(f"{output.name}: saved mode {record['width']}x{record['height']} "
                     f"unavailable, leaving current mode")
         targets.append(Target(
-            name=entry["name"],
+            name=output.name,
             enabled=True,
             mode_id=mode_id,
             pos=tuple(entry["pos"]),
@@ -651,6 +683,37 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
             rotation=entry.get("rotation"),
             priority=entry.get("priority"),
         ))
+    return targets
+
+
+def _apply_and_wait(targets: list[Target], dummy_name: str, settle_timeout: float,
+                    label: str) -> bool:
+    try:
+        apply_targets(targets)
+    except KScreenError as exc:
+        log(f"restore ({label}) failed: {exc}")
+        return False
+    expected = {t.name for t in targets if t.enabled}
+    settled = wait_until(
+        lambda snap: expected <= {o.name for o in snap.values() if o.enabled}
+        and dummy_name not in {o.name for o in snap.values() if o.enabled} - expected,
+        settle_timeout,
+    )
+    if settled is None:
+        log(f"WARNING: {label} did not settle as expected after restore")
+    return settled is not None
+
+
+def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bool:
+    try:
+        outputs = read_outputs()
+    except KScreenError as exc:
+        log(f"cannot read outputs while restoring: {exc}")
+        return False
+
+    claimed: set[str] = set()
+    targets = _restore_targets([e for e in snapshot if e["name"] != dummy_name],
+                               outputs, claimed)
 
     if not any(t.enabled for t in targets):
         log("WARNING: no saved output is connected; keeping the dummy enabled")
@@ -661,21 +724,7 @@ def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bo
 
     if not targets:
         return True
-    try:
-        apply_targets(targets)
-    except KScreenError as exc:
-        log(f"restore failed: {exc}")
-        return False
-
-    expected = {t.name for t in targets if t.enabled}
-    settled = wait_until(
-        lambda snap: expected <= {o.name for o in snap.values() if o.enabled}
-        and dummy_name not in {o.name for o in snap.values() if o.enabled} - expected,
-        settle_timeout,
-    )
-    if settled is None:
-        log(f"WARNING: {dummy_name} did not settle as expected after restore")
-    return settled is not None
+    return _apply_and_wait(targets, dummy_name, settle_timeout, "layout")
 
 
 def cmd_on(cfg, args) -> int:
