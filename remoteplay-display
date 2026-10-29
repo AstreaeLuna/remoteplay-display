@@ -49,6 +49,7 @@ DEFAULTS = {
     "staged": "",
     "stage_gap": "0.5",
     "chain_settle": "3.0",
+    "rescue_max_refresh": "0",
 }
 
 ROTATION_NAMES = {1: "none", 2: "left", 4: "inverted", 8: "right"}
@@ -927,6 +928,7 @@ def cmd_rescue(cfg, _args) -> int:
     silently fails. This resolves them fresh.
     """
     dummy_name = cfg["dummy"].strip()
+    cap = float(cfg.get("rescue_max_refresh", "0") or 0)
     try:
         outputs = read_outputs()
     except KScreenError as exc:
@@ -937,7 +939,9 @@ def cmd_rescue(cfg, _args) -> int:
     for output in outputs.values():
         if not output.connected or output.name == dummy_name:
             continue
-        mode = max(output.modes, key=lambda m: (m.width * m.height, m.refresh), default=None)
+        candidates = [m for m in output.modes if cap <= 0 or m.refresh <= cap + 0.5]
+        mode = max(candidates or output.modes,
+                   key=lambda m: (m.width * m.height, m.refresh), default=None)
         targets.append(Target(
             name=output.name, enabled=True, mode_id=mode.id if mode else None,
             pos=(x, 0), scale=1.0, rotation=0, priority=len(targets) + 1,

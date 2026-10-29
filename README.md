@@ -91,6 +91,7 @@ The service handles Steam sessions automatically. Every layout carries an owner 
 | `staged` | *(empty)* | connector names of outputs behind an MST hub; they are disabled before, and re-enabled after, everything else, and matched by EDID afterwards so renumbering does not matter |
 | `stage_gap` | `0.5` | seconds between disabling the staged outputs and switching the rest |
 | `chain_settle` | `3.0` | on restore, how long the chain must hold still after re-enumerating before its outputs are re-enabled |
+| `rescue_max_refresh` | `0` | cap on the refresh rate `rescue` picks per output; 0 means highest available |
 
 ## Dummy EDID
 
