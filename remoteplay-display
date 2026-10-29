@@ -602,6 +602,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
                 "scale": o.scale,
                 "rotation": o.rotation,
                 "mode": _mode_record(o),
+                "hdr": o.hdr_enabled if o.hdr_capable else None,
             }
             for o in outputs.values()
             if o.connected and o.name != dummy_name
@@ -779,6 +780,7 @@ def _restore_targets(entries: list[dict], outputs: dict[str, Output],
             scale=entry.get("scale"),
             rotation=entry.get("rotation"),
             priority=entry.get("priority"),
+            hdr=entry.get("hdr") if output.hdr_capable else None,
         ))
     return targets
 
