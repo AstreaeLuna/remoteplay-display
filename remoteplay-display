@@ -46,6 +46,9 @@ DEFAULTS = {
     "scratch_desktop": "true",
     "scratch_desktop_name": "Streaming",
     "settle_timeout": "10.0",
+    "staged": "",
+    "stage_gap": "0.5",
+    "chain_settle": "3.0",
 }
 
 ROTATION_NAMES = {1: "none", 2: "left", 4: "inverted", 8: "right"}
@@ -73,6 +76,56 @@ def load_config() -> configparser.SectionProxy:
     return parser["remoteplay"]
 
 
+def _csv(cfg, key: str) -> set[str]:
+    return {n.strip() for n in str(cfg.get(key, "")).split(",") if n.strip()}
+
+
+STAGED_CACHE = STATE_DIR / "staged-identities.json"
+
+
+def staged_outputs(cfg) -> set[str]:
+    """Connector names switched in their own stage, before and after everything else.
+
+    Meant for sinks behind an MST hub. Disabling or re-enabling the primary output
+    while their streams are live forces amdgpu to rebuild the whole chain mid-modeset,
+    which KWin does not survive; taking the chain down first and bringing it back last
+    keeps each modeset to one link. Names are only used to identify them at switch
+    time -- on restore they are matched by EDID, because MST sinks get renumbered.
+    """
+    return _csv(cfg, "staged")
+
+
+def resolve_staged(cfg, outputs: dict[str, "Output"]) -> set[str]:
+    """Current connector names of the staged outputs.
+
+    Names in the config are a one-time hint: the first time one is seen connected its
+    EDID identity is cached, and from then on the match is by identity, so the chain
+    being renumbered by the kernel does not silently turn staging off.
+    """
+    names = staged_outputs(cfg)
+    if not names:
+        return set()
+    try:
+        cached = set(json.loads(STAGED_CACHE.read_text(encoding="utf-8")))
+    except (OSError, json.JSONDecodeError):
+        cached = set()
+    learned = {edid_identity(n) for n in names if n in outputs and outputs[n].connected}
+    learned.discard(None)
+    if learned - cached:
+        cached |= learned
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            STAGED_CACHE.write_text(json.dumps(sorted(cached)), encoding="utf-8")
+        except OSError as exc:
+            log(f"could not cache staged identities: {exc}")
+    resolved = {o.name for o in outputs.values()
+                if o.connected and (o.name in names or edid_identity(o.name) in cached)}
+    if not resolved:
+        log(f"WARNING: 'staged' is set ({', '.join(sorted(names))}) but no connected output "
+            f"matches by name or EDID; switching will NOT be staged")
+    return resolved
+
+
 def edid_identity(connector: str) -> str | None:
     """A stable identity for whatever is plugged into a connector, from its EDID.
 
@@ -93,6 +146,38 @@ def edid_identity(connector: str) -> str | None:
                 parts.append(block[5:18].split(b"\n")[0].decode("ascii", "replace").strip())
         return "|".join(parts)
     return None
+
+
+def _connected_identities() -> dict[str, str]:
+    """connector name -> EDID identity for every connected connector, straight from sysfs."""
+    found: dict[str, str] = {}
+    for card in sorted(Path("/sys/class/drm").glob("card*-*")):
+        try:
+            if (card / "status").read_text().strip() != "connected":
+                continue
+        except OSError:
+            continue
+        name = card.name.split("-", 1)[1]
+        ident = edid_identity(name)
+        if ident:
+            found[name] = ident
+    return found
+
+
+def wait_chain_settled(identities: list[str], timeout: float, quiet: float) -> bool:
+    """Wait until every wanted EDID identity is connected and the set has stopped changing."""
+    deadline = time.monotonic() + timeout
+    last, stable_since = None, None
+    while True:
+        present = _connected_identities()
+        have = all(any(v == want for v in present.values()) for want in identities)
+        if present != last:
+            last, stable_since = present, time.monotonic()
+        elif have and time.monotonic() - stable_since >= quiet:
+            return True
+        if time.monotonic() >= deadline:
+            return have
+        time.sleep(0.5)
 
 
 @dataclass(frozen=True)
@@ -496,6 +581,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
 
         outputs = read_outputs()
         dummy_name = cfg["dummy"].strip()
+        staged = resolve_staged(cfg, outputs) - {dummy_name}
         dummy = outputs.get(dummy_name)
         if dummy is None or not dummy.connected:
             log(f"dummy output {dummy_name!r} is not connected; refusing to switch")
@@ -509,6 +595,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
             {
                 "name": o.name,
                 "identity": edid_identity(o.name),
+                "staged": o.name in staged,
                 "enabled": o.enabled,
                 "priority": o.priority,
                 "pos": list(o.pos),
@@ -521,17 +608,20 @@ def activate(cfg, owner: str, hint=None) -> bool:
         ]
         _repair_snapshot(snapshot)
 
+        stage1 = [Target(name=o.name, enabled=False)
+                  for o in outputs.values() if o.name in staged and o.enabled]
         targets = [Target(name=dummy_name, enabled=True, mode_id=mode.id, pos=(0, 0),
                           scale=1.0, rotation=1, priority=1,
                           hdr=_wants_hdr(cfg) if dummy.hdr_capable else None)]
         targets += [
             Target(name=o.name, enabled=False)
             for o in outputs.values()
-            if o.name != dummy_name and o.enabled
+            if o.name != dummy_name and o.name not in staged and o.enabled
         ]
 
         log(f"switching to {dummy_name} @ {mode} ({reason}); "
-            f"disabling {[t.name for t in targets if not t.enabled] or 'nothing'}")
+            f"disabling {[t.name for t in stage1] or 'nothing'} first, then "
+            f"{[t.name for t in targets if not t.enabled] or 'nothing'}")
         write_state({
             "active": True,
             "owner": owner,
@@ -541,18 +631,26 @@ def activate(cfg, owner: str, hint=None) -> bool:
             "snapshot": snapshot,
             "inhibitor_pid": None,
         })
+        settle = float(cfg["settle_timeout"])
         try:
+            if stage1:
+                apply_targets(stage1)
+                gone = {t.name for t in stage1}
+                if wait_until(lambda snap: not gone & {o.name for o in snap.values() if o.enabled},
+                              settle) is None:
+                    log(f"WARNING: {sorted(gone)} still enabled after stage 1; continuing")
+                time.sleep(float(cfg["stage_gap"]))
             apply_targets(targets)
         except KScreenError as exc:
             log(f"switch failed: {exc}; restoring")
             clear_state()
-            _restore(snapshot, dummy_name, float(cfg["settle_timeout"]))
+            _restore(snapshot, dummy_name, cfg)
             return False
 
         settled = wait_until(
             lambda snap: _only_enabled(snap, dummy_name)
             and _mode_matches(snap.get(dummy_name), mode),
-            float(cfg["settle_timeout"]),
+            settle,
         )
         if settled is None:
             log("WARNING: display state did not settle as expected; retrying once")
@@ -562,7 +660,7 @@ def activate(cfg, owner: str, hint=None) -> bool:
                 log(f"retry failed: {exc}")
             settled = wait_until(
                 lambda snap: _only_enabled(snap, dummy_name),
-                float(cfg["settle_timeout"]),
+                settle,
             )
             if settled is None:
                 log("ERROR: could not confirm dummy-only layout")
@@ -632,8 +730,7 @@ def deactivate(cfg, force: bool = False, owner: str | None = None) -> bool:
             return True
         stop_inhibitor(state.get("inhibitor_pid"))
         leave_scratch_desktop(state)
-        ok = _restore(state.get("snapshot") or [], state.get("dummy", ""),
-                      float(cfg["settle_timeout"]))
+        ok = _restore(state.get("snapshot") or [], state.get("dummy", ""), cfg)
         clear_state()
         log("desktop layout restored" if ok else "desktop layout restore incomplete")
         return ok
@@ -704,27 +801,58 @@ def _apply_and_wait(targets: list[Target], dummy_name: str, settle_timeout: floa
     return settled is not None
 
 
-def _restore(snapshot: list[dict], dummy_name: str, settle_timeout: float) -> bool:
+def _restore(snapshot: list[dict], dummy_name: str, cfg) -> bool:
+    """Bring the saved layout back, chain-staged outputs last.
+
+    Stage 1 disables the dummy and re-enables every unstaged output (the primary
+    among them). Stage 2 waits for the MST chain to finish re-enumerating behind
+    that, then re-enables the staged outputs, matched by EDID since their names
+    may have changed.
+    """
+    settle_timeout = float(cfg["settle_timeout"])
     try:
         outputs = read_outputs()
     except KScreenError as exc:
         log(f"cannot read outputs while restoring: {exc}")
         return False
 
-    claimed: set[str] = set()
-    targets = _restore_targets([e for e in snapshot if e["name"] != dummy_name],
-                               outputs, claimed)
+    skip = {dummy_name}
+    entries = [e for e in snapshot if e["name"] not in skip]
+    first = [e for e in entries if not e.get("staged")]
+    later = [e for e in entries if e.get("staged")]
 
-    if not any(t.enabled for t in targets):
+    claimed: set[str] = set()
+    targets = _restore_targets(first, outputs, claimed)
+
+    if not any(t.enabled for t in targets) and not later:
         log("WARNING: no saved output is connected; keeping the dummy enabled")
         if dummy_name in outputs:
             targets.append(Target(name=dummy_name, enabled=True))
     elif dummy_name in outputs:
         targets.insert(0, Target(name=dummy_name, enabled=False))
 
-    if not targets:
-        return True
-    return _apply_and_wait(targets, dummy_name, settle_timeout, "layout")
+    ok = True
+    if targets:
+        ok = _apply_and_wait(targets, dummy_name, settle_timeout, "stage 1")
+
+    if later:
+        wanted = [e["identity"] for e in later if e.get("identity")]
+        if not wait_chain_settled(wanted, settle_timeout * 2, float(cfg["chain_settle"])):
+            log("WARNING: chain outputs did not all reappear; restoring what is there")
+        try:
+            outputs = read_outputs()
+        except KScreenError as exc:
+            log(f"cannot read outputs for stage 2: {exc}")
+            return False
+        targets = _restore_targets(later, outputs, claimed)
+        if targets:
+            ok = _apply_and_wait(targets, dummy_name, settle_timeout, "stage 2") and ok
+        elif not any(o.enabled for o in outputs.values() if o.name not in skip):
+            log("WARNING: nothing came back; re-enabling the dummy so the desktop is not dark")
+            if dummy_name in outputs:
+                _apply_and_wait([Target(name=dummy_name, enabled=True)], "", settle_timeout, "fallback")
+            ok = False
+    return ok
 
 
 def cmd_on(cfg, args) -> int:
@@ -880,6 +1008,9 @@ def cmd_doctor(cfg, args) -> int:
         state = "connected" if output.connected else "disconnected"
         print(f"  {output.name:<10} {state:<13} edid={name!r}{mark}")
 
+    if staged_outputs(cfg):
+        print(f"staged:    {sorted(resolve_staged(cfg, outputs)) or 'NONE MATCHED'} "
+              f"(config: {', '.join(sorted(staged_outputs(cfg)))})")
     dummy = outputs.get(dummy_name)
     if dummy is None or not dummy.connected:
         print(f"dummy:     NOT CONNECTED ({dummy_name}) - fix 'dummy' in {CONFIG_PATH}")

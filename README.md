@@ -88,6 +88,9 @@ The service handles Steam sessions automatically. Every layout carries an owner 
 | `steam_log` | `~/.steam/steam/logs/streaming_log.txt` | where to read the client capture hint |
 | `capture_hint_max_age` | `120` | seconds before a capture hint is considered stale |
 | `settle_timeout` | `10.0` | seconds to wait for KWin to apply a layout |
+| `staged` | *(empty)* | connector names of outputs behind an MST hub; they are disabled before, and re-enabled after, everything else, and matched by EDID afterwards so renumbering does not matter |
+| `stage_gap` | `0.5` | seconds between disabling the staged outputs and switching the rest |
+| `chain_settle` | `3.0` | on restore, how long the chain must hold still after re-enumerating before its outputs are re-enabled |
 
 ## Dummy EDID
 
